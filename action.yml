@@ -2,6 +2,9 @@ name: data-factory-deploy
 description: Deploy Azure Data Factory resources
 
 inputs:
+  subscriptionId:
+    description: 'Azure subscription ID'
+    required: true
   resourceGroupName:
     description: 'Data Factory resource group name'
     required: true
@@ -17,9 +20,9 @@ inputs:
     required: false
     default: 'ARMTemplateParametersForFactory.json'
   additionalParameters:
-    description: 'Parameters which will be replaced in the ARM template'
+    description: 'Additional parameters as a JSON object to override in the ARM template'
     required: false
-    default: ''
+    default: '{}'
   skipAzModuleInstallation:
     description: 'Parameters which skip the Az module installation'
     required: false
@@ -42,12 +45,27 @@ runs:
           -deleteDeployment $false
       shell: pwsh
 
+    - name: Merge deployment parameters
+      id: merge-params
+      run: |
+        $base = @{ "factoryName" = "${{ inputs.dataFactoryName }}" }
+        $additional = '${{ inputs.additionalParameters }}' | ConvertFrom-Json -AsHashtable
+        foreach ($key in $additional.Keys) { $base[$key] = $additional[$key] }
+        $merged = $base | ConvertTo-Json -Compress
+        echo "params=$merged" >> $env:GITHUB_OUTPUT
+      shell: pwsh
+
     - name: Run ARM deploy
-      uses: azure/arm-deploy@v2
+      uses: azure/bicep-deploy@v2
       with:
-        resourceGroupName: ${{ inputs.resourceGroupName }}
-        template: ${{ inputs.armTemplateFile }}
-        parameters: ${{ inputs.armTemplateParametersFile }} factoryName=${{ inputs.dataFactoryName }} ${{ inputs.additionalParameters }}
+        type: deployment
+        operation: create
+        scope: resourceGroup
+        subscription-id: ${{ inputs.subscriptionId }}
+        resource-group-name: ${{ inputs.resourceGroupName }}
+        template-file: ${{ inputs.armTemplateFile }}
+        parameters-file: ${{ inputs.armTemplateParametersFile }}
+        parameters: ${{ steps.merge-params.outputs.params }}
         
     - name: Run Post-deployment script
       run: |
