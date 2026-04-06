@@ -27,6 +27,10 @@ inputs:
     description: 'Parameters which skip the Az module installation'
     required: false
     default: 'false'
+  skipIntegrationRuntimes:
+    description: 'Skip deploying and deleting integration runtimes'
+    required: false
+    default: 'false'
 
 runs:
   using: 'composite'
@@ -42,17 +46,8 @@ runs:
           -ResourceGroupName "${{ inputs.resourceGroupName }}" `
           -DataFactoryName "${{ inputs.dataFactoryName }}" `
           -predeployment $true `
-          -deleteDeployment $false
-      shell: pwsh
-
-    - name: Merge deployment parameters
-      id: merge-params
-      run: |
-        $base = @{ "factoryName" = "${{ inputs.dataFactoryName }}" }
-        $additional = '${{ inputs.additionalParameters }}' | ConvertFrom-Json -AsHashtable
-        foreach ($key in $additional.Keys) { $base[$key] = $additional[$key] }
-        $merged = $base | ConvertTo-Json -Compress
-        echo "params=$merged" >> $env:GITHUB_OUTPUT
+          -deleteDeployment $false `
+          -skipIntegrationRuntimes ('${{ inputs.skipIntegrationRuntimes }}' -eq 'true')
       shell: pwsh
 
     - name: Run ARM deploy
@@ -65,7 +60,7 @@ runs:
         resource-group-name: ${{ inputs.resourceGroupName }}
         template-file: ${{ inputs.armTemplateFile }}
         parameters-file: ${{ inputs.armTemplateParametersFile }}
-        parameters: ${{ steps.merge-params.outputs.params }}
+        parameters: ${{ inputs.additionalParameters }}
         
     - name: Run Post-deployment script
       run: |
@@ -74,5 +69,6 @@ runs:
           -ResourceGroupName "${{ inputs.resourceGroupName }}" `
           -DataFactoryName '${{ inputs.dataFactoryName }}' `
           -predeployment $false `
-          -deleteDeployment $true
+          -deleteDeployment $true `
+          -skipIntegrationRuntimes ('${{ inputs.skipIntegrationRuntimes }}' -eq 'true')
       shell: pwsh

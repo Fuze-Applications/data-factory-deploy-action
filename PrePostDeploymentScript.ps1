@@ -4,7 +4,8 @@ param
     [parameter(Mandatory = $false)] [String] $ResourceGroupName,
     [parameter(Mandatory = $false)] [String] $DataFactoryName,
     [parameter(Mandatory = $false)] [Bool] $predeployment=$true,
-    [parameter(Mandatory = $false)] [Bool] $deleteDeployment=$false
+    [parameter(Mandatory = $false)] [Bool] $deleteDeployment=$false,
+    [parameter(Mandatory = $false)] [Bool] $skipIntegrationRuntimes=$false
 )
 
 function getPipelineDependencies {
@@ -137,6 +138,18 @@ function Get-SortedLinkedServices {
 $templateJson = Get-Content $armTemplate | ConvertFrom-Json
 $resources = $templateJson.resources
 
+if ($skipIntegrationRuntimes -eq $true) {
+    Write-Host "Skipping integration runtimes - removing from ARM template"
+    $templateJson.resources = @($templateJson.resources | Where-Object { $_.type -ne "Microsoft.DataFactory/factories/integrationRuntimes" })
+    foreach ($resource in $templateJson.resources) {
+        if ($resource.dependsOn) {
+            $resource.dependsOn = @($resource.dependsOn | Where-Object { $_ -notlike "*integrationRuntimes*" })
+        }
+    }
+    $templateJson | ConvertTo-Json -Depth 50 | Set-Content $armTemplate
+    $resources = $templateJson.resources
+}
+
 #Triggers 
 Write-Host "Getting triggers"
 $triggersInTemplate = $resources | Where-Object { $_.type -eq "Microsoft.DataFactory/factories/triggers" }
@@ -205,11 +218,16 @@ else {
     $linkedservicesNames = $linkedservicesTemplate | ForEach-Object {$_.name.Substring(37, $_.name.Length-40)}
     $deletedlinkedservices = $linkedservicesADF | Where-Object { $linkedservicesNames -notcontains $_.Name }
     #Integrationruntimes
-    Write-Host "Getting integration runtimes"
-    $integrationruntimesADF = Get-AzDataFactoryV2IntegrationRuntime -DataFactoryName $DataFactoryName -ResourceGroupName $ResourceGroupName
-    $integrationruntimesTemplate = $resources | Where-Object { $_.type -eq "Microsoft.DataFactory/factories/integrationruntimes" }
-    $integrationruntimesNames = $integrationruntimesTemplate | ForEach-Object {$_.name.Substring(37, $_.name.Length-40)}
-    $deletedintegrationruntimes = $integrationruntimesADF | Where-Object { $integrationruntimesNames -notcontains $_.Name }
+    if ($skipIntegrationRuntimes -ne $true) {
+        Write-Host "Getting integration runtimes"
+        $integrationruntimesADF = Get-AzDataFactoryV2IntegrationRuntime -DataFactoryName $DataFactoryName -ResourceGroupName $ResourceGroupName
+        $integrationruntimesTemplate = $resources | Where-Object { $_.type -eq "Microsoft.DataFactory/factories/integrationruntimes" }
+        $integrationruntimesNames = $integrationruntimesTemplate | ForEach-Object {$_.name.Substring(37, $_.name.Length-40)}
+        $deletedintegrationruntimes = $integrationruntimesADF | Where-Object { $integrationruntimesNames -notcontains $_.Name }
+    } else {
+        Write-Host "Skipping integration runtimes"
+        $deletedintegrationruntimes = @()
+    }
 
     #Delete resources
     Write-Host "Deleting triggers"
@@ -259,18 +277,23 @@ else {
         Write-Host "Deleting ARM deployment ... under resource group: " $ResourceGroupName
         $deployments = Get-AzResourceGroupDeployment -ResourceGroupName $ResourceGroupName
         $deploymentsToConsider = $deployments | Where { $_.DeploymentName -like "ArmTemplate_master*" -or $_.DeploymentName -like "ArmTemplateForFactory*" } | Sort-Object -Property Timestamp -Descending
-        $deploymentName = $deploymentsToConsider[0].DeploymentName
 
-       Write-Host "Deployment to be deleted: " $deploymentName
-        $deploymentOperations = Get-AzResourceGroupDeploymentOperation -DeploymentName $deploymentName -ResourceGroupName $ResourceGroupName
-        $deploymentsToDelete = $deploymentOperations | Where { $_.properties.targetResource.id -like "*Microsoft.Resources/deployments*" }
+        if ($deploymentsToConsider) {
+            $deploymentName = $deploymentsToConsider[0].DeploymentName
 
-        $deploymentsToDelete | ForEach-Object { 
-            Write-host "Deleting inner deployment: " $_.properties.targetResource.id
-            Remove-AzResourceGroupDeployment -Id $_.properties.targetResource.id
+            Write-Host "Deployment to be deleted: " $deploymentName
+            $deploymentOperations = Get-AzResourceGroupDeploymentOperation -DeploymentName $deploymentName -ResourceGroupName $ResourceGroupName
+            $deploymentsToDelete = $deploymentOperations | Where { $_.properties.targetResource.id -like "*Microsoft.Resources/deployments*" }
+
+            $deploymentsToDelete | ForEach-Object {
+                Write-host "Deleting inner deployment: " $_.properties.targetResource.id
+                Remove-AzResourceGroupDeployment -Id $_.properties.targetResource.id
+            }
+            Write-Host "Deleting deployment: " $deploymentName
+            Remove-AzResourceGroupDeployment -ResourceGroupName $ResourceGroupName -Name $deploymentName
+        } else {
+            Write-Host "No matching ARM deployments found to clean up"
         }
-        Write-Host "Deleting deployment: " $deploymentName
-        Remove-AzResourceGroupDeployment -ResourceGroupName $ResourceGroupName -Name $deploymentName
     }
 
     #Start active triggers - after cleanup efforts
