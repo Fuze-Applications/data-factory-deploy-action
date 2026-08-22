@@ -46,7 +46,6 @@ function pipelineSortUtil {
         pipelineSortUtil -pipeline $pipelineNameResourceDict[$_] -pipelineNameResourceDict $pipelineNameResourceDict -visited $visited -sortedList $sortedList
     }
     $sortedList.Push($pipeline)
-
 }
 
 function Get-SortedPipelines {
@@ -309,5 +308,76 @@ else {
         }
         Write-Host "Starting trigger" $_.Name
         Start-AzDataFactoryV2Trigger -ResourceGroupName $ResourceGroupName -DataFactoryName $DataFactoryName -Name $_.Name -Force
+    }
+
+    # -----------------------------------------------------------------
+    # Add SFTP operations to Event Grid filter
+    # Run exactly ONCE after all triggers are fully subscribed
+    # -----------------------------------------------------------------
+    Write-Host "Patching Event Grid subscription filters for SFTP events..."
+    
+    $sftpOps = @("SftpCreate", "SftpCommit", "SftpRename")
+
+    # Ensure module is imported into session
+    Import-Module Az.EventGrid -ErrorAction SilentlyContinue
+
+    # 1. Fetch shallow list of topics
+    $shallowTopics = Get-AzEventGridSystemTopic -ResourceGroupName $ResourceGroupName
+
+    if ($shallowTopics) {
+        foreach ($shallowTopic in $shallowTopics) {
+            # 2. Fetch full object by Name to force SDK to hydrate .Source and .TopicType
+            $topic = Get-AzEventGridSystemTopic -ResourceGroupName $ResourceGroupName -Name $shallowTopic.Name
+
+            # 3. Match on Storage Account topics or default if it's the only System Topic present
+            if ($topic.Source -match "storageAccounts" -or $topic.TopicType -match "Storage" -or $shallowTopics.Count -eq 1) {
+                $allSubs = Get-AzEventGridSystemTopicEventSubscription -ResourceGroupName $ResourceGroupName -SystemTopicName $topic.Name
+
+                foreach ($subSummary in $allSubs) {
+                    Write-Host "Applying SFTP filters to subscription: $($subSummary.Name) on topic $($topic.Name) ... " -NoNewline -ForegroundColor Cyan
+
+                    # Fetch the full subscription so we have its current Filter/Destination state
+                    $existingSub = Get-AzEventGridSystemTopicEventSubscription `
+                        -ResourceGroupName $ResourceGroupName `
+                        -SystemTopicName $topic.Name `
+                        -EventSubscriptionName $subSummary.Name
+
+                    # Skip if already patched, so re-runs are idempotent and cheap
+                    $dataApiFilter = $existingSub.FilterAdvancedFilter | Where-Object { $_.Key -eq "data.api" -and $_.OperatorType -eq "StringIn" }
+                    if ($dataApiFilter -and (@($dataApiFilter.Value) | Where-Object { $sftpOps -notcontains $_ }).Count -eq 0 -and (@($sftpOps) | Where-Object { $dataApiFilter.Value -notcontains $_ }).Count -eq 0) {
+                        Write-Host "Already up to date, skipping." -ForegroundColor Yellow
+                        continue
+                    }
+
+                    $updatedFilters = $existingSub.FilterAdvancedFilter | ForEach-Object {
+                        if ($_.Key -eq "data.api" -and $_.OperatorType -eq "StringIn") {
+                            $mergedValues = @($_.Value) + $sftpOps | Select-Object -Unique
+                            New-AzEventGridStringInAdvancedFilterObject -Key "data.api" -Value $mergedValues
+                        }
+                        elseif ($_.OperatorType -eq "NumberGreaterThan") {
+                            New-AzEventGridNumberGreaterThanAdvancedFilterObject -Key $_.Key -Value $_.Value
+                        }
+                        else {
+                            Write-Warning "Unhandled filter type on $($subSummary.Name): Key=$($_.Key) OperatorType=$($_.OperatorType) — passing through as-is, verify manually."
+                            $_
+                        }
+                    }
+
+                    Update-AzEventGridSystemTopicEventSubscription `
+                        -ResourceGroupName $ResourceGroupName `
+                        -SystemTopicName $topic.Name `
+                        -EventSubscriptionName $subSummary.Name `
+                        -FilterIncludedEventType $existingSub.FilterIncludedEventType `
+                        -FilterSubjectBeginsWith $existingSub.FilterSubjectBeginsWith `
+                        -FilterSubjectEndsWith $existingSub.FilterSubjectEndsWith `
+                        -FilterIsSubjectCaseSensitive:$existingSub.FilterIsSubjectCaseSensitive `
+                        -FilterAdvancedFilter $updatedFilters | Out-Null
+
+                    Write-Host "Success!" -ForegroundColor Green
+                }
+            }
+        }
+    } else {
+        Write-Warning "Could not find any Event Grid System Topics in Resource Group: $ResourceGroupName"
     }
 }
