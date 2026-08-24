@@ -316,8 +316,11 @@ else {
     # -----------------------------------------------------------------
     Write-Host "Patching Event Grid subscription filters for SFTP events..."
     
-    $sftpOps = @("SftpCreate", "SftpCommit", "SftpRename")
-
+    # Trigger on SftpCommit events to ensure file is written before processing
+    # we cannot use "SftpRename" for this triggering because it is unsupported by
+    # ADF
+    $sftpOps = @("SftpCommit")
+    
     # Ensure module is imported into session
     Import-Module Az.EventGrid -ErrorAction SilentlyContinue
 
@@ -326,7 +329,7 @@ else {
 
     if ($shallowTopics) {
         foreach ($shallowTopic in $shallowTopics) {
-            # 2. Fetch full object by Name to force SDK to hydrate .Source and .TopicType
+            # 2. Fetch full object by Name to force SDK to hydrate properties
             $topic = Get-AzEventGridSystemTopic -ResourceGroupName $ResourceGroupName -Name $shallowTopic.Name
 
             # 3. Match on Storage Account topics or default if it's the only System Topic present
@@ -336,33 +339,37 @@ else {
                 foreach ($subSummary in $allSubs) {
                     Write-Host "Applying SFTP filters to subscription: $($subSummary.Name) on topic $($topic.Name) ... " -NoNewline -ForegroundColor Cyan
 
-                    # Fetch the full subscription so we have its current Filter/Destination state
+                    # Fetch the full subscription so we have its current Filter state
                     $existingSub = Get-AzEventGridSystemTopicEventSubscription `
                         -ResourceGroupName $ResourceGroupName `
                         -SystemTopicName $topic.Name `
                         -EventSubscriptionName $subSummary.Name
 
-                    # Skip if already patched, so re-runs are idempotent and cheap
-                    $dataApiFilter = $existingSub.FilterAdvancedFilter | Where-Object { $_.Key -eq "data.api" -and $_.OperatorType -eq "StringIn" }
-                    if ($dataApiFilter -and (@($dataApiFilter.Value) | Where-Object { $sftpOps -notcontains $_ }).Count -eq 0 -and (@($sftpOps) | Where-Object { $dataApiFilter.Value -notcontains $_ }).Count -eq 0) {
-                        Write-Host "Already up to date, skipping." -ForegroundColor Yellow
-                        continue
-                    }
+                    # Filter out any existing data.contentLength filter (removes > 0 constraint)
+                    # and update the data.api filter to include all required SFTP operations
+                    $updatedFilters = @()
 
-                    $updatedFilters = $existingSub.FilterAdvancedFilter | ForEach-Object {
-                        if ($_.Key -eq "data.api" -and $_.OperatorType -eq "StringIn") {
-                            $mergedValues = @($_.Value) + $sftpOps | Select-Object -Unique
-                            New-AzEventGridStringInAdvancedFilterObject -Key "data.api" -Value $mergedValues
+                    foreach ($filter in $existingSub.FilterAdvancedFilter) {
+                        # Drop contentLength filters to allow 0-byte initial SFTP file creations
+                        if ($filter.Key -eq "data.contentLength") {
+                            Write-Host "`n  --> Removing data.contentLength filter to allow 0-byte initial SFTP uploads" -ForegroundColor Yellow
+                            continue
                         }
-                        elseif ($_.OperatorType -eq "NumberGreaterThan") {
-                            New-AzEventGridNumberGreaterThanAdvancedFilterObject -Key $_.Key -Value $_.Value
+
+                        if ($filter.Key -eq "data.api" -and $filter.OperatorType -eq "StringIn") {
+                            $mergedValues = @($filter.Value) + $sftpOps | Select-Object -Unique
+                            $updatedFilters += New-AzEventGridStringInAdvancedFilterObject -Key "data.api" -Value $mergedValues
+                        }
+                        elseif ($filter.OperatorType -eq "NumberGreaterThan") {
+                            $updatedFilters += New-AzEventGridNumberGreaterThanAdvancedFilterObject -Key $filter.Key -Value $filter.Value
                         }
                         else {
-                            Write-Warning "Unhandled filter type on $($subSummary.Name): Key=$($_.Key) OperatorType=$($_.OperatorType) — passing through as-is, verify manually."
-                            $_
+                            Write-Warning "Unhandled filter type on $($subSummary.Name): Key=$($filter.Key) OperatorType=$($filter.OperatorType) — passing through as-is."
+                            $updatedFilters += $filter
                         }
                     }
 
+                    # Execute the update call
                     Update-AzEventGridSystemTopicEventSubscription `
                         -ResourceGroupName $ResourceGroupName `
                         -SystemTopicName $topic.Name `
